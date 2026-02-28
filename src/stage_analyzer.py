@@ -58,12 +58,6 @@ class StageConfig:
     # 状态突破时的放量确认阈值（VolRatio >= 1.5 确认有效突破）
     breakout_volume_threshold: float = 1.5
 
-    # 牛市中连续N周跌破MA34则不视为牛市
-    bull_break_weeks: int = 2
-
-    # 连续N周在MA34下方 + 斜率下行 → 强制熊市
-    bear_confirm_weeks: int = 4
-
     # ATR 自适应系数（固定阈值 / 全行业 ATR% 中位数 ≈ 0.047）
     atr_alpha_multiplier: float = 1.0       # price_position_threshold ≈ 1.0 * atr_pct
     atr_slope_multiplier: float = 0.3       # slope_flat_threshold ≈ 0.3 * atr_pct
@@ -291,13 +285,6 @@ def classify_stage_stateful(
     alpha = adaptive_alpha if adaptive_alpha is not None else config.price_position_threshold
     slope_flat = adaptive_slope_flat if adaptive_slope_flat is not None else config.slope_flat_threshold
 
-    # ── 硬性规则 ──
-    is_slope_neg = ma_slope < -slope_flat
-
-    # 连续4周跌破MA + 斜率下行 → 强制熊市（无论前一状态）
-    if consecutive_below_ma >= config.bear_confirm_weeks and is_slope_neg:
-        return 1, 0.90
-
     # ── 计算各状态评分 ──
     s_bull = _score_bull(price_pos, ma_slope, cross_count, volume_ratio, support_held, config,
                          alpha=alpha, slope_flat=slope_flat)
@@ -309,10 +296,6 @@ def classify_stage_stateful(
                                   alpha=alpha, slope_flat=slope_flat)
 
     scores = {1: s_bear, 2: s_bottom, 3: s_bull, 4: s_top}
-
-    # 连续2周跌破MA → 不可能在牛市
-    if consecutive_below_ma >= config.bull_break_weeks:
-        scores[3] = 0.0
 
     # ── 状态机转换逻辑 ──
     if previous_state == 0:
