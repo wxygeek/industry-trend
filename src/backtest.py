@@ -1,20 +1,24 @@
 """行业轮动回测引擎 — 基于Weinstein阶段信号的行业轮动策略
 
 策略逻辑:
-- 买入信号: compute_signal_series() 产生 breakout_confirmed（确认突破）
-- 卖出信号: compute_signal_series() 产生 breakdown_confirmed（确认崩盘）
-- 仓位管理: 等权5仓位，每次买入当前总资产的20%
-- 弱势替换: 持仓满5个时新信号出现，用收益率最低的换出
+- 分批建仓: approaching_breakout 试探买入30%, breakout_confirmed 加仓70%
+- 假突破止损: breakout_failed 卖出试探仓
+- 卖出信号: breakdown_confirmed（确认崩盘）
+- 强制卖出: ATR波动率止损
+- 仓位管理: 等权仓位，ATR弹性替换（仅确认突破触发）
+- 行业分散: 同一级行业下最多持仓3个二级行业
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from src.stage_analyzer import compute_signal_series, StageConfig
+from config.industries import get_level2_parent, is_blacklisted
+from src.stage_analyzer import compute_signal_series, compute_consecutive_below_ma, StageConfig
 
 
 # ── 数据结构 ──────────────────────────────────────────────
@@ -43,6 +47,7 @@ class Position:
     entry_date: pd.Timestamp
     entry_price: float
     shares: float
+    is_partial: bool = False  # True = 仅30%试探仓（approaching_breakout）
 
     def market_value(self, current_price: float) -> float:
         return self.shares * current_price
@@ -59,6 +64,7 @@ class BacktestConfig:
 
     initial_capital: float = 10_000.0
     max_positions: int = 5
+    max_same_parent: int = 3  # 同一级行业下最多持仓的二级行业数
     start_date: str | None = None
     end_date: str | None = None
 
@@ -119,6 +125,12 @@ def prepare_all_signals(
         price_cols = weekly_df[["date", "close"]].copy()
         price_cols["code"] = code
         price_cols["name"] = name
+        # 强制卖出指标
+        price_cols["consecutive_below_ma"] = compute_consecutive_below_ma(weekly_df)
+        price_cols["atr_stop"] = (
+            weekly_df["close"].rolling(8, min_periods=8).min().shift(1)
+            - 3.0 * weekly_df["atr14"]
+        )
         all_prices.append(price_cols)
 
         # 仅保留有信号的行
@@ -138,7 +150,70 @@ def prepare_all_signals(
     return signals_df, prices_df
 
 
+def compute_historical_atr_pct(
+    industry_data: dict[str, tuple[str, pd.DataFrame]],
+) -> dict[str, float]:
+    """计算每个行业的历史ATR%中位数（股性/弹性指标）
+
+    ATR% = atr14 / close，取全部历史的中位数作为行业特征弹性。
+    值越大说明该行业历史波动越大、弹性越强、潜在上涨空间越大。
+    """
+    result = {}
+    for code, (name, weekly_df) in industry_data.items():
+        if "atr14" in weekly_df.columns:
+            atr_pct = (weekly_df["atr14"] / weekly_df["close"]).dropna()
+            result[code] = float(atr_pct.median()) if not atr_pct.empty else 0.0
+        else:
+            result[code] = 0.0
+    return result
+
+
+def save_atr_ranking(
+    industry_data: dict[str, tuple[str, pd.DataFrame]],
+    out_dir: Path,
+) -> dict[str, float]:
+    """计算并保存行业ATR%排名到 CSV 文件
+
+    Returns:
+        {code: atr_pct} 字典（同时保存到 out_dir/atr_ranking.csv）
+    """
+    atr_ranking = compute_historical_atr_pct(industry_data)
+    rows = []
+    for code, atr_pct in sorted(atr_ranking.items(), key=lambda x: x[1], reverse=True):
+        name = industry_data[code][0] if code in industry_data else ""
+        rows.append({"code": code, "name": name, "atr_pct": round(atr_pct, 6)})
+    df = pd.DataFrame(rows)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_dir / "atr_ranking.csv", index=False)
+    return atr_ranking
+
+
+def load_atr_ranking(analysis_dir: Path) -> dict[str, float] | None:
+    """从 CSV 文件加载预计算的ATR%排名
+
+    Returns:
+        {code: atr_pct} 字典，文件不存在时返回 None
+    """
+    csv_path = analysis_dir / "atr_ranking.csv"
+    if not csv_path.exists():
+        return None
+    df = pd.read_csv(csv_path, dtype={"code": str})
+    return dict(zip(df["code"], df["atr_pct"]))
+
+
 # ── 辅助函数 ──────────────────────────────────────────────
+
+
+def _count_same_parent(
+    code: str,
+    positions: dict[str, Position],
+    parent_lookup: dict[str, str],
+) -> int:
+    """统计持仓中与 code 同属一个一级行业的二级行业数量"""
+    parent = parent_lookup.get(code)
+    if parent is None:
+        return 0
+    return sum(1 for c in positions if parent_lookup.get(c) == parent)
 
 
 def _get_portfolio_value(
@@ -206,13 +281,144 @@ def _execute_buy(
     )
 
 
+def _execute_topup(
+    pos: Position,
+    date: pd.Timestamp,
+    price: float,
+    buy_value: float,
+    trades: list[Trade],
+) -> float:
+    """对已有试探仓加仓，更新加权平均成本价，返回买入金额"""
+    new_shares = buy_value / price
+    total_shares = pos.shares + new_shares
+    pos.entry_price = (pos.shares * pos.entry_price + new_shares * price) / total_shares
+    pos.shares = total_shares
+    pos.is_partial = False
+    trades.append(Trade(
+        date=date,
+        code=pos.code,
+        name=pos.name,
+        action="buy",
+        price=price,
+        shares=new_shares,
+        value=buy_value,
+        reason="breakout_confirmed",
+    ))
+    return buy_value
+
+
 # ── 核心回测循环 ──────────────────────────────────────────
+
+
+def _buy_with_atr_replacement(
+    candidates: list[tuple[str, str, float]],
+    positions: dict[str, Position],
+    bt_config: BacktestConfig,
+    cash: float,
+    latest_prices: dict[str, float],
+    atr_ranking: dict[str, float],
+    parent_lookup: dict[str, str],
+    date: pd.Timestamp,
+    trades: list[Trade],
+    reason: str,
+    buy_pct: float = 1.0,
+    partial: bool = False,
+) -> float:
+    """通用的买入+ATR替换逻辑
+
+    有空余仓位时直接买入；仓位已满时将已持仓和新候选一起按ATR%排序，
+    保留ATR%最高的行业组合。
+
+    Args:
+        candidates: [(code, name, price), ...] 买入候选
+        buy_pct: 买入比例（approaching_breakout=0.30, breakout_confirmed=1.0）
+        partial: 是否标记为试探仓
+
+    Returns:
+        更新后的现金余额
+    """
+    available_slots = bt_config.max_positions - len(positions)
+
+    if len(candidates) <= available_slots:
+        # 有空余仓位，直接买入
+        for code, name, price in candidates:
+            if (parent_lookup
+                    and _count_same_parent(code, positions, parent_lookup) >= bt_config.max_same_parent):
+                continue
+            portfolio_value = _get_portfolio_value(cash, positions, latest_prices)
+            buy_value = portfolio_value * bt_config.portion_pct * buy_pct
+            buy_value = min(buy_value, cash)
+            if buy_value < 1.0:
+                continue
+            pos = _execute_buy(code, name, date, price, buy_value, reason, trades)
+            pos.is_partial = partial
+            positions[code] = pos
+            cash -= buy_value
+    else:
+        # 仓位不足（含满仓）：按ATR%排序，贪心选择最优组合
+        all_candidates: dict[str, dict] = {}
+
+        for code, pos in positions.items():
+            all_candidates[code] = {"type": "existing", "position": pos}
+
+        for code, name, price in candidates:
+            all_candidates[code] = {
+                "type": "new", "code": code, "name": name, "price": price,
+            }
+
+        # 按历史ATR%降序排列（高弹性 = 大上涨空间优先）
+        sorted_items = sorted(
+            all_candidates.items(),
+            key=lambda x: atr_ranking.get(x[0], 0.0),
+            reverse=True,
+        )
+
+        # 贪心选择：遵守 max_positions 和 max_same_parent 约束
+        keep_codes: set[str] = set()
+        parent_count: dict[str, int] = {}
+        for code, info in sorted_items:
+            if len(keep_codes) >= bt_config.max_positions:
+                break
+            parent = parent_lookup.get(code)
+            if parent and parent_count.get(parent, 0) >= bt_config.max_same_parent:
+                continue
+            keep_codes.add(code)
+            if parent:
+                parent_count[parent] = parent_count.get(parent, 0) + 1
+
+        # 卖出被替换的持仓
+        codes_to_sell = [c for c in list(positions.keys()) if c not in keep_codes]
+        for code in codes_to_sell:
+            price = latest_prices.get(code, positions[code].entry_price)
+            cash += _execute_sell(
+                positions[code], date, price, "replaced_weakest", trades
+            )
+            del positions[code]
+
+        # 买入新选中的行业
+        for code, info in sorted_items:
+            if info["type"] == "new" and code in keep_codes:
+                portfolio_value = _get_portfolio_value(cash, positions, latest_prices)
+                buy_value = portfolio_value * bt_config.portion_pct * buy_pct
+                buy_value = min(buy_value, cash)
+                if buy_value < 1.0:
+                    continue
+                pos = _execute_buy(
+                    info["code"], info["name"], date, info["price"],
+                    buy_value, reason, trades,
+                )
+                pos.is_partial = partial
+                positions[pos.code] = pos
+                cash -= buy_value
+
+    return cash
 
 
 def run_backtest(
     industry_data: dict[str, tuple[str, pd.DataFrame]],
     bt_config: BacktestConfig | None = None,
     stage_config: StageConfig | None = None,
+    atr_ranking: dict[str, float] | None = None,
 ) -> BacktestResult:
     """执行完整回测
 
@@ -220,6 +426,7 @@ def run_backtest(
         industry_data: {code: (name, weekly_df)} 与 app.py load_all_data() 格式一致
         bt_config: 回测参数
         stage_config: 阶段分析参数
+        atr_ranking: 预计算的行业ATR%排名（None时自动计算）
     """
     if bt_config is None:
         bt_config = BacktestConfig()
@@ -228,13 +435,33 @@ def run_backtest(
 
     signals_df, prices_df = prepare_all_signals(industry_data, stage_config)
 
+    # 行业历史弹性（ATR%）：优先使用传入的预计算数据
+    if atr_ranking is None:
+        atr_ranking = compute_historical_atr_pct(industry_data)
+
+    # 一级行业归属映射（仅二级行业有效）
+    atr_ranking = compute_historical_atr_pct(industry_data)
+    parent_lookup: dict[str, str] = {}
+    for code in industry_data:
+        parent = get_level2_parent(code)
+        if parent is not None:
+            parent_lookup[code] = parent
+
     # 构建价格查找表: {date: {code: close}}
     price_lookup: dict[pd.Timestamp, dict[str, float]] = {}
+    # 强制卖出指标查找表
+    below_ma_lookup: dict[pd.Timestamp, dict[str, int]] = {}
+    atr_stop_lookup: dict[pd.Timestamp, dict[str, float]] = {}
     for _, row in prices_df.iterrows():
         d = row["date"]
         if d not in price_lookup:
             price_lookup[d] = {}
+            below_ma_lookup[d] = {}
+            atr_stop_lookup[d] = {}
         price_lookup[d][row["code"]] = row["close"]
+        below_ma_lookup[d][row["code"]] = int(row["consecutive_below_ma"])
+        if pd.notna(row["atr_stop"]):
+            atr_stop_lookup[d][row["code"]] = row["atr_stop"]
 
     # 构建信号查找表: {date: [(code, name, signal), ...]}
     signal_lookup: dict[pd.Timestamp, list[tuple[str, str, str]]] = {}
@@ -289,83 +516,111 @@ def run_backtest(
         for code in sell_codes:
             del positions[code]
 
-        # ── 第二步：处理买入信号 ──
+        # ── 第二步：强制卖出检查 ──
+        force_sell_codes = set()
+        for code in list(positions.keys()):
+            if code in sell_codes:
+                continue
+
+            price = latest_prices.get(code)
+            if price is None:
+                continue
+
+            # ATR波动率止损（收盘价 < 前8周最低收盘价 - 3×ATR14）
+            atr_stop = atr_stop_lookup.get(date, {}).get(code)
+            if atr_stop is not None and price < atr_stop:
+                cash += _execute_sell(
+                    positions[code], date, price, "force_sell_atr_stop", trades
+                )
+                force_sell_codes.add(code)
+
+        for code in force_sell_codes:
+            del positions[code]
+
+        # ── 第三步：试探仓假突破检查（连续2周收盘低于MA34） ──
+        failed_sell_codes = set()
+        for code in list(positions.keys()):
+            if not positions[code].is_partial:
+                continue
+            below_weeks = below_ma_lookup.get(date, {}).get(code, 0)
+            if below_weeks >= 2:
+                price = latest_prices.get(code)
+                if price is not None:
+                    cash += _execute_sell(
+                        positions[code], date, price, "breakout_failed", trades
+                    )
+                    failed_sell_codes.add(code)
+
+        for code in failed_sell_codes:
+            del positions[code]
+
+        # ── 第四步：approaching_breakout 买入30%试探仓 ──
+        ab_candidates = []
+        for code, name, signal in week_signals:
+            if signal == "approaching_breakout" and code not in positions:
+                if is_blacklisted(code):
+                    continue
+                price = latest_prices.get(code)
+                if price is not None and price > 0:
+                    ab_candidates.append((code, name, price))
+
+        if ab_candidates:
+            cash = _buy_with_atr_replacement(
+                candidates=ab_candidates,
+                positions=positions,
+                bt_config=bt_config,
+                cash=cash,
+                latest_prices=latest_prices,
+                atr_ranking=atr_ranking,
+                parent_lookup=parent_lookup,
+                date=date,
+                trades=trades,
+                reason="approaching_breakout",
+                buy_pct=0.30,
+                partial=True,
+            )
+
+        # ── 第五步：breakout_confirmed 加仓/全仓买入 ──
+
+        # 5a. 加仓已有试探仓（不需要新仓位）
+        for code, name, signal in week_signals:
+            if signal == "breakout_confirmed" and code in positions and positions[code].is_partial:
+                price = latest_prices.get(code)
+                if price is None or price <= 0:
+                    continue
+                portfolio_value = _get_portfolio_value(cash, positions, latest_prices)
+                topup_value = portfolio_value * bt_config.portion_pct * 0.70
+                topup_value = min(topup_value, cash)
+                if topup_value < 1.0:
+                    continue
+                _execute_topup(positions[code], date, price, topup_value, trades)
+                cash -= topup_value
+
+        # 5b. 全新买入（无试探仓的行业，100%建仓，满仓时ATR替换）
         buy_candidates = []
         for code, name, signal in week_signals:
             if signal == "breakout_confirmed" and code not in positions:
+                if is_blacklisted(code):
+                    continue
                 price = latest_prices.get(code)
                 if price is not None and price > 0:
                     buy_candidates.append((code, name, price))
 
         if buy_candidates:
-            available_slots = bt_config.max_positions - len(positions)
-
-            if len(buy_candidates) <= available_slots:
-                # 简单情况：直接买入所有候选
-                for code, name, price in buy_candidates:
-                    portfolio_value = _get_portfolio_value(cash, positions, latest_prices)
-                    buy_value = portfolio_value * bt_config.portion_pct
-                    buy_value = min(buy_value, cash)
-                    if buy_value < 1.0:
-                        continue
-                    pos = _execute_buy(code, name, date, price, buy_value, "breakout_confirmed", trades)
-                    positions[code] = pos
-                    cash -= buy_value
-            else:
-                # 满仓替换逻辑：需要在所有候选中挑选最强的
-                # 收集所有候选（现有持仓 + 新买入候选）
-                all_candidates: dict[str, dict] = {}
-
-                # 现有持仓的收益率
-                for code, pos in positions.items():
-                    current_price = latest_prices.get(code, pos.entry_price)
-                    all_candidates[code] = {
-                        "type": "existing",
-                        "return_pct": pos.return_pct(current_price),
-                        "position": pos,
-                    }
-
-                # 新候选收益率为 0（刚进入）
-                for code, name, price in buy_candidates:
-                    all_candidates[code] = {
-                        "type": "new",
-                        "return_pct": 0.0,
-                        "code": code,
-                        "name": name,
-                        "price": price,
-                    }
-
-                # 按收益率降序排列，保留前 max_positions 个
-                sorted_items = sorted(
-                    all_candidates.items(),
-                    key=lambda x: x[1]["return_pct"],
-                    reverse=True,
-                )
-                keep_codes = set(code for code, _ in sorted_items[: bt_config.max_positions])
-
-                # 卖出不在保留集中的现有持仓
-                codes_to_sell = [c for c in list(positions.keys()) if c not in keep_codes]
-                for code in codes_to_sell:
-                    price = latest_prices.get(code, positions[code].entry_price)
-                    cash += _execute_sell(
-                        positions[code], date, price, "replaced_weakest", trades
-                    )
-                    del positions[code]
-
-                # 买入在保留集中的新候选
-                for code, info in sorted_items[: bt_config.max_positions]:
-                    if info["type"] == "new" and code in keep_codes:
-                        portfolio_value = _get_portfolio_value(cash, positions, latest_prices)
-                        buy_value = portfolio_value * bt_config.portion_pct
-                        buy_value = min(buy_value, cash)
-                        if buy_value < 1.0:
-                            continue
-                        pos = _execute_buy(
-                            info["code"], info["name"], date, info["price"],
-                            buy_value, "breakout_confirmed", trades,
-                        )
-                        positions[pos.code] = pos
-                        cash -= buy_value
+            cash = _buy_with_atr_replacement(
+                candidates=buy_candidates,
+                positions=positions,
+                bt_config=bt_config,
+                cash=cash,
+                latest_prices=latest_prices,
+                atr_ranking=atr_ranking,
+                parent_lookup=parent_lookup,
+                date=date,
+                trades=trades,
+                reason="breakout_confirmed",
+                buy_pct=1.0,
+                partial=False,
+            )
 
         # ── 记录本周净值 ──
         portfolio_value = _get_portfolio_value(cash, positions, latest_prices)

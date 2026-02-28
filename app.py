@@ -33,6 +33,7 @@ from src.stage_analyzer import (
 )
 from src.backtest import (
     run_backtest, compute_benchmark, BacktestConfig, BacktestResult,
+    save_atr_ranking, load_atr_ranking,
 )
 
 STAGE_COLORS = {
@@ -75,6 +76,7 @@ def load_all_data(level: int):
         out_dir = analysis_dir_for_level(level)
         out_dir.mkdir(parents=True, exist_ok=True)
         summary.to_csv(out_dir / "stage_summary.csv", index=False)
+        save_atr_ranking(industry_data, out_dir)
 
     return industry_data, summary
 
@@ -488,6 +490,44 @@ def _render_positions_chart(result: BacktestResult):
     st.plotly_chart(fig, use_container_width=True)
 
 
+def _render_weight_chart(result: BacktestResult):
+    """渲染总仓位变化面积图（持仓比例 vs 现金比例）"""
+    ec = result.equity_curve
+    if ec.empty:
+        st.info("无持仓数据")
+        return
+
+    cash_pct = ec["cash"] / ec["portfolio_value"] * 100
+    position_pct = 100 - cash_pct
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=ec["date"], y=position_pct,
+        mode="lines", name="持仓",
+        stackgroup="one",
+        line=dict(width=0.5, color="#1E88E5"),
+        fillcolor="rgba(30, 136, 229, 0.4)",
+    ))
+    fig.add_trace(go.Scatter(
+        x=ec["date"], y=cash_pct,
+        mode="lines", name="现金",
+        stackgroup="one",
+        line=dict(width=0.5, color="#E0E0E0"),
+        fillcolor="rgba(224, 224, 224, 0.4)",
+    ))
+    fig.update_layout(
+        title="总仓位变化",
+        xaxis_title="日期",
+        yaxis_title="占比 (%)",
+        yaxis=dict(range=[0, 100]),
+        height=250,
+        margin=dict(l=40, r=40, t=50, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        hovermode="x unified",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
 def _render_current_positions(result: BacktestResult, industry_data: dict):
     """渲染当前持仓表"""
     st.markdown("**当前持仓**")
@@ -635,7 +675,8 @@ def render_backtest_tab(industry_data: dict, level: int = 1):
                 start_date=str(start_dt),
                 end_date=str(end_dt),
             )
-            result = run_backtest(industry_data, bt_config)
+            atr_ranking = load_atr_ranking(analysis_dir_for_level(level))
+            result = run_backtest(industry_data, bt_config, atr_ranking=atr_ranking)
             benchmark = compute_benchmark(
                 industry_data,
                 initial_capital=float(initial_capital),
@@ -678,6 +719,9 @@ def render_backtest_tab(industry_data: dict, level: int = 1):
     # 收益曲线
     _render_equity_curve(result, benchmark, level)
 
+    # 仓位权重变化
+    _render_weight_chart(result)
+
     # 回撤曲线 + 持仓数量
     col_dd, col_pos = st.columns(2)
     with col_dd:
@@ -691,6 +735,26 @@ def render_backtest_tab(industry_data: dict, level: int = 1):
         _render_current_positions(result, industry_data)
     with col_right:
         _render_trade_history(result)
+
+
+# ── 文档 Tab ──────────────────────────────────────────────
+
+DOCS_DIR = Path(__file__).resolve().parent / "docs"
+
+DOC_FILES = [
+    ("阶段分析", "stage_analysis.md"),
+    ("交易信号", "trading_signals.md"),
+    ("回测策略", "backtest_strategy.md"),
+]
+
+
+def render_docs_tab():
+    """渲染策略文档 Tab"""
+    for title, filename in DOC_FILES:
+        path = DOCS_DIR / filename
+        if path.exists():
+            with st.expander(title, expanded=False):
+                st.markdown(path.read_text(encoding="utf-8"))
 
 
 # ── 主入口 ──────────────────────────────────────────────
@@ -735,12 +799,13 @@ def main():
         )
         return
 
-    # 4 Tab 页切换
+    # Tab 页切换
     tab_names = []
     if has_l1:
         tab_names += ["一级趋势分析", "一级策略回测"]
     if has_l2:
         tab_names += ["二级趋势分析", "二级策略回测"]
+    tab_names.append("策略文档")
 
     tabs = st.tabs(tab_names)
 
@@ -759,6 +824,10 @@ def main():
         tab_idx += 1
         with tabs[tab_idx]:
             render_backtest_tab(l2_data, level=2)
+        tab_idx += 1
+
+    with tabs[tab_idx]:
+        render_docs_tab()
 
 
 if __name__ == "__main__":

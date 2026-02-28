@@ -196,6 +196,36 @@ SW_LEVEL2_INDUSTRIES = {
 }
 
 
+# ── 二级行业黑名单 ──────────────────────────────────────────────
+# 黑名单内的行业即使有买入信号也不会触发任何购买
+# 格式: 直接指定二级行业名称，或通过一级行业代码批量屏蔽其下所有二级行业
+
+# 按一级行业批量屏蔽的行业代码
+_BLACKLISTED_PARENTS = {
+    "801010",  # 农林牧渔
+    "801210",  # 社会服务
+    "801780",  # 银行
+}
+
+# 单独指定的二级行业名称
+_BLACKLISTED_NAMES = {
+    "教育",
+    "房地产开发",
+    "房地产服务",
+}
+
+# 构建完整的黑名单行业代码集合
+BLACKLISTED_INDUSTRY_CODES: set[str] = set()
+for _code, (_name, _parent) in SW_LEVEL2_INDUSTRIES.items():
+    if _parent in _BLACKLISTED_PARENTS or _name in _BLACKLISTED_NAMES:
+        BLACKLISTED_INDUSTRY_CODES.add(_code)
+
+
+def is_blacklisted(code: str) -> bool:
+    """检查行业代码是否在黑名单中"""
+    return code in BLACKLISTED_INDUSTRY_CODES
+
+
 def get_industries(level: int) -> dict[str, str]:
     """获取指定级别的行业字典（code -> name 扁平格式）"""
     if level == 1:
