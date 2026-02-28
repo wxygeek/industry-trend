@@ -29,6 +29,7 @@ from src.akshare_downloader import (
 )
 from src.kline import generate_weekly_kline
 from src.stage_analyzer import batch_analyze, StageConfig
+from src.market_volume import download_and_save_market
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,6 +52,10 @@ def cmd_download(level: str = "1", headless: bool = True):
             industries = get_industries(2)
             logger.info(f"开始下载{len(industries)}个申万二级行业数据（akshare）...")
             akshare_download_all(level=2)
+
+    # 同时下载大盘成交量数据
+    logger.info("下载上证综指大盘数据（用于成交量过滤）...")
+    download_and_save_market()
 
 
 def cmd_analyze(level: str = "1", config: StageConfig | None = None) -> pd.DataFrame:

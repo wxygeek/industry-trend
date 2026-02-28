@@ -35,6 +35,10 @@ from src.backtest import (
     run_backtest, compute_benchmark, BacktestConfig, BacktestResult,
     save_atr_ranking, load_atr_ranking,
 )
+from src.market_volume import (
+    load_market_data, download_and_save_market,
+    get_volume_percentile_lookup, get_volume_percentile_df,
+)
 
 STAGE_COLORS = {
     1: "rgba(76, 175, 80, 0.15)",      # 绿 - 熊市
@@ -528,6 +532,62 @@ def _render_weight_chart(result: BacktestResult):
     st.plotly_chart(fig, use_container_width=True)
 
 
+def _render_volume_percentile_chart(result: BacktestResult):
+    """渲染大盘成交量百分位图"""
+    ec = result.equity_curve
+    vol_pct = ec["volume_percentile"].dropna()
+    if vol_pct.empty:
+        return
+
+    threshold = result.config.volume_percentile_threshold
+
+    fig = go.Figure()
+
+    # 百分位曲线
+    fig.add_trace(go.Scatter(
+        x=ec.loc[vol_pct.index, "date"],
+        y=vol_pct * 100,
+        mode="lines",
+        name="成交量百分位",
+        line=dict(color="#1E88E5", width=1.5),
+        fill="tozeroy",
+        fillcolor="rgba(30, 136, 229, 0.15)",
+    ))
+
+    # 阈值线
+    fig.add_hline(
+        y=threshold * 100,
+        line_dash="dash",
+        line_color="#F44336",
+        annotation_text=f"买入阈值 {threshold*100:.0f}%",
+        annotation_position="top right",
+    )
+
+    # 标注禁止买入区域
+    fig.add_hrect(
+        y0=0, y1=threshold * 100,
+        fillcolor="rgba(244, 67, 54, 0.08)",
+        line_width=0,
+        annotation_text="禁止买入",
+        annotation_position="inside top left",
+    )
+
+    fig.update_layout(
+        title="A股大盘成交量5年滚动百分位（上证综指）",
+        xaxis_title="日期",
+        yaxis_title="百分位 (%)",
+        yaxis=dict(range=[0, 100]),
+        height=250,
+        margin=dict(l=40, r=40, t=50, b=40),
+        hovermode="x unified",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption(
+        f"成交量过滤：当周A股成交量5年百分位 < {threshold*100:.0f}% 时禁止买入，"
+        f"仅允许持仓和卖出操作。"
+    )
+
+
 def _render_current_positions(result: BacktestResult, industry_data: dict):
     """渲染当前持仓表"""
     st.markdown("**当前持仓**")
@@ -630,28 +690,48 @@ def render_backtest_tab(industry_data: dict, level: int = 1):
     min_date = sorted_dates[0].to_pydatetime().date()
     max_date = sorted_dates[-1].to_pydatetime().date()
 
-    # 参数设置
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        date_range = st.date_input(
-            "回测区间",
-            value=(datetime(2005, 1, 1).date(), max_date),
-            min_value=min_date,
-            max_value=max_date,
-            key=f"bt_date_l{level}",
-        )
-    with col2:
-        initial_capital = st.number_input(
-            "初始资金", value=10000, min_value=1000, step=1000,
-            key=f"bt_capital_l{level}",
-        )
-    with col3:
-        default_max_pos = 5 if level == 1 else 10
-        max_pos_limit = 15 if level == 2 else 10
-        max_positions = st.number_input(
-            "最大持仓数", value=default_max_pos, min_value=1, max_value=max_pos_limit, step=1,
-            key=f"bt_maxpos_l{level}",
-        )
+    # 参数设置（使用 form 防止输入时页面刷新）
+    with st.form(key=f"bt_form_l{level}"):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            date_range = st.date_input(
+                "回测区间",
+                value=(datetime(2005, 1, 1).date(), max_date),
+                min_value=min_date,
+                max_value=max_date,
+                key=f"bt_date_l{level}",
+            )
+        with col2:
+            initial_capital = st.number_input(
+                "初始资金", value=10000, min_value=1000, step=1000,
+                key=f"bt_capital_l{level}",
+            )
+        with col3:
+            default_max_pos = 5 if level == 1 else 10
+            max_pos_limit = 15 if level == 2 else 10
+            max_positions = st.number_input(
+                "最大持仓数", value=default_max_pos, min_value=1, max_value=max_pos_limit, step=1,
+                key=f"bt_maxpos_l{level}",
+            )
+
+        # 成交量过滤参数
+        vol_col1, vol_col2 = st.columns(2)
+        with vol_col1:
+            volume_filter = st.checkbox(
+                "启用大盘成交量过滤",
+                value=True,
+                help="当A股成交量处于5年百分位低位时，不执行买入操作",
+                key=f"bt_volfilt_l{level}",
+            )
+        with vol_col2:
+            volume_threshold = st.slider(
+                "成交量百分位阈值",
+                min_value=0, max_value=100, value=60, step=5,
+                help="仅当周成交量百分位 >= 此值时才允许买入",
+                key=f"bt_volpct_l{level}",
+            )
+
+        run_clicked = st.form_submit_button("运行回测", type="primary", use_container_width=True)
 
     # 处理日期输入（可能是元组或单个日期）
     if isinstance(date_range, tuple) and len(date_range) == 2:
@@ -663,20 +743,31 @@ def render_backtest_tab(industry_data: dict, level: int = 1):
     session_key_result = f"backtest_result_l{level}"
     session_key_benchmark = f"backtest_benchmark_l{level}"
 
-    run_clicked = st.button("运行回测", type="primary", use_container_width=True,
-                            key=f"bt_run_l{level}")
-
     if run_clicked:
         n = len(industry_data)
         with st.spinner(f"正在运行{level_name}级行业回测（{n}个行业）..."):
+            # 加载大盘成交量百分位数据
+            vol_lookup = None
+            if volume_filter:
+                market_df = load_market_data()
+                if market_df is not None and not market_df.empty:
+                    vol_lookup = get_volume_percentile_lookup(market_df)
+                else:
+                    st.warning("未找到大盘数据，成交量过滤将被跳过。请先在侧边栏刷新大盘数据。")
+
             bt_config = BacktestConfig(
                 initial_capital=float(initial_capital),
                 max_positions=int(max_positions),
                 start_date=str(start_dt),
                 end_date=str(end_dt),
+                volume_filter=volume_filter,
+                volume_percentile_threshold=volume_threshold / 100.0,
             )
             atr_ranking = load_atr_ranking(analysis_dir_for_level(level))
-            result = run_backtest(industry_data, bt_config, atr_ranking=atr_ranking)
+            result = run_backtest(
+                industry_data, bt_config, atr_ranking=atr_ranking,
+                volume_percentile_lookup=vol_lookup,
+            )
             benchmark = compute_benchmark(
                 industry_data,
                 initial_capital=float(initial_capital),
@@ -718,6 +809,10 @@ def render_backtest_tab(industry_data: dict, level: int = 1):
 
     # 收益曲线
     _render_equity_curve(result, benchmark, level)
+
+    # 大盘成交量百分位图
+    if result.config.volume_filter and "volume_percentile" in result.equity_curve.columns:
+        _render_volume_percentile_chart(result)
 
     # 仓位权重变化
     _render_weight_chart(result)
@@ -783,6 +878,19 @@ def main():
             ak_download(level=2)
             st.cache_data.clear()
             st.rerun()
+
+    if st.sidebar.button("🔄 刷新大盘数据", use_container_width=True):
+        with st.spinner("正在下载上证综指数据..."):
+            download_and_save_market()
+            st.cache_data.clear()
+            st.rerun()
+
+    # 显示大盘数据状态
+    market_df = load_market_data()
+    if market_df is not None and not market_df.empty:
+        st.sidebar.markdown(f"**大盘数据:** {market_df['date'].max().strftime('%Y-%m-%d')}")
+    else:
+        st.sidebar.markdown("**大盘数据:** 未下载")
 
     # 加载数据
     l1_data, l1_summary = load_all_data(1)

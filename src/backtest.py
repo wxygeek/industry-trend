@@ -67,6 +67,8 @@ class BacktestConfig:
     max_same_parent: int = 3  # 同一级行业下最多持仓的二级行业数
     start_date: str | None = None
     end_date: str | None = None
+    volume_filter: bool = False  # 是否启用大盘成交量过滤
+    volume_percentile_threshold: float = 0.6  # 成交量百分位阈值（0.6 = 60%）
 
     @property
     def portion_pct(self) -> float:
@@ -419,6 +421,7 @@ def run_backtest(
     bt_config: BacktestConfig | None = None,
     stage_config: StageConfig | None = None,
     atr_ranking: dict[str, float] | None = None,
+    volume_percentile_lookup: dict[pd.Timestamp, float] | None = None,
 ) -> BacktestResult:
     """执行完整回测
 
@@ -427,6 +430,7 @@ def run_backtest(
         bt_config: 回测参数
         stage_config: 阶段分析参数
         atr_ranking: 预计算的行业ATR%排名（None时自动计算）
+        volume_percentile_lookup: 大盘成交量百分位查找表 {date: percentile}
     """
     if bt_config is None:
         bt_config = BacktestConfig()
@@ -484,6 +488,17 @@ def run_backtest(
 
     if not all_dates:
         return BacktestResult(config=bt_config)
+
+    # 构建成交量百分位对齐查找表（用 merge_asof 对齐到回测日期）
+    vol_pct_aligned: dict[pd.Timestamp, float] = {}
+    if bt_config.volume_filter and volume_percentile_lookup:
+        vol_df = pd.DataFrame(
+            {"date": list(volume_percentile_lookup.keys()),
+             "vol_pct": list(volume_percentile_lookup.values())}
+        ).sort_values("date")
+        bt_dates_df = pd.DataFrame({"date": all_dates})
+        aligned = pd.merge_asof(bt_dates_df, vol_df, on="date")
+        vol_pct_aligned = dict(zip(aligned["date"], aligned["vol_pct"]))
 
     # 初始化
     cash = bt_config.initial_capital
@@ -554,73 +569,81 @@ def run_backtest(
         for code in failed_sell_codes:
             del positions[code]
 
-        # ── 第四步：approaching_breakout 买入30%试探仓 ──
-        ab_candidates = []
-        for code, name, signal in week_signals:
-            if signal == "approaching_breakout" and code not in positions:
-                if is_blacklisted(code):
-                    continue
-                price = latest_prices.get(code)
-                if price is not None and price > 0:
-                    ab_candidates.append((code, name, price))
+        # ── 成交量过滤：大盘量能不足时跳过所有买入 ──
+        vol_pct = vol_pct_aligned.get(date)
+        volume_ok = True
+        if bt_config.volume_filter and vol_pct is not None:
+            if vol_pct < bt_config.volume_percentile_threshold:
+                volume_ok = False
 
-        if ab_candidates:
-            cash = _buy_with_atr_replacement(
-                candidates=ab_candidates,
-                positions=positions,
-                bt_config=bt_config,
-                cash=cash,
-                latest_prices=latest_prices,
-                atr_ranking=atr_ranking,
-                parent_lookup=parent_lookup,
-                date=date,
-                trades=trades,
-                reason="approaching_breakout",
-                buy_pct=0.30,
-                partial=True,
-            )
+        # ── 第四步：approaching_breakout 买入30%试探仓 ──
+        if volume_ok:
+            ab_candidates = []
+            for code, name, signal in week_signals:
+                if signal == "approaching_breakout" and code not in positions:
+                    if is_blacklisted(code):
+                        continue
+                    price = latest_prices.get(code)
+                    if price is not None and price > 0:
+                        ab_candidates.append((code, name, price))
+
+            if ab_candidates:
+                cash = _buy_with_atr_replacement(
+                    candidates=ab_candidates,
+                    positions=positions,
+                    bt_config=bt_config,
+                    cash=cash,
+                    latest_prices=latest_prices,
+                    atr_ranking=atr_ranking,
+                    parent_lookup=parent_lookup,
+                    date=date,
+                    trades=trades,
+                    reason="approaching_breakout",
+                    buy_pct=0.30,
+                    partial=True,
+                )
 
         # ── 第五步：breakout_confirmed 加仓/全仓买入 ──
+        if volume_ok:
+            # 5a. 加仓已有试探仓（不需要新仓位）
+            for code, name, signal in week_signals:
+                if signal == "breakout_confirmed" and code in positions and positions[code].is_partial:
+                    price = latest_prices.get(code)
+                    if price is None or price <= 0:
+                        continue
+                    portfolio_value = _get_portfolio_value(cash, positions, latest_prices)
+                    topup_value = portfolio_value * bt_config.portion_pct * 0.70
+                    topup_value = min(topup_value, cash)
+                    if topup_value < 1.0:
+                        continue
+                    _execute_topup(positions[code], date, price, topup_value, trades)
+                    cash -= topup_value
 
-        # 5a. 加仓已有试探仓（不需要新仓位）
-        for code, name, signal in week_signals:
-            if signal == "breakout_confirmed" and code in positions and positions[code].is_partial:
-                price = latest_prices.get(code)
-                if price is None or price <= 0:
-                    continue
-                portfolio_value = _get_portfolio_value(cash, positions, latest_prices)
-                topup_value = portfolio_value * bt_config.portion_pct * 0.70
-                topup_value = min(topup_value, cash)
-                if topup_value < 1.0:
-                    continue
-                _execute_topup(positions[code], date, price, topup_value, trades)
-                cash -= topup_value
+            # 5b. 全新买入（无试探仓的行业，100%建仓，满仓时ATR替换）
+            buy_candidates = []
+            for code, name, signal in week_signals:
+                if signal == "breakout_confirmed" and code not in positions:
+                    if is_blacklisted(code):
+                        continue
+                    price = latest_prices.get(code)
+                    if price is not None and price > 0:
+                        buy_candidates.append((code, name, price))
 
-        # 5b. 全新买入（无试探仓的行业，100%建仓，满仓时ATR替换）
-        buy_candidates = []
-        for code, name, signal in week_signals:
-            if signal == "breakout_confirmed" and code not in positions:
-                if is_blacklisted(code):
-                    continue
-                price = latest_prices.get(code)
-                if price is not None and price > 0:
-                    buy_candidates.append((code, name, price))
-
-        if buy_candidates:
-            cash = _buy_with_atr_replacement(
-                candidates=buy_candidates,
-                positions=positions,
-                bt_config=bt_config,
-                cash=cash,
-                latest_prices=latest_prices,
-                atr_ranking=atr_ranking,
-                parent_lookup=parent_lookup,
-                date=date,
-                trades=trades,
-                reason="breakout_confirmed",
-                buy_pct=1.0,
-                partial=False,
-            )
+            if buy_candidates:
+                cash = _buy_with_atr_replacement(
+                    candidates=buy_candidates,
+                    positions=positions,
+                    bt_config=bt_config,
+                    cash=cash,
+                    latest_prices=latest_prices,
+                    atr_ranking=atr_ranking,
+                    parent_lookup=parent_lookup,
+                    date=date,
+                    trades=trades,
+                    reason="breakout_confirmed",
+                    buy_pct=1.0,
+                    partial=False,
+                )
 
         # ── 记录本周净值 ──
         portfolio_value = _get_portfolio_value(cash, positions, latest_prices)
@@ -629,6 +652,7 @@ def run_backtest(
             "portfolio_value": portfolio_value,
             "cash": cash,
             "n_positions": len(positions),
+            "volume_percentile": vol_pct_aligned.get(date),
         })
 
     equity_curve = pd.DataFrame(equity_records)
