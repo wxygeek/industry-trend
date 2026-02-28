@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 from datetime import datetime
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -20,6 +21,9 @@ from src.stage_analyzer import (
     batch_analyze, analyze_industry, detect_stage_transitions,
     compute_stage_series, compute_signal_series,
     StageConfig, BULLISH_SIGNALS, BEARISH_SIGNALS, SIGNAL_LABELS,
+)
+from src.backtest import (
+    run_backtest, compute_benchmark, BacktestConfig, BacktestResult,
 )
 
 STAGE_COLORS = {
@@ -251,31 +255,11 @@ def render_kline_chart(weekly_df: pd.DataFrame, code: str, name: str, weeks: int
     st.plotly_chart(fig, use_container_width=True)
 
 
-def main():
-    st.set_page_config(page_title="行业趋势跟踪", page_icon="📊", layout="wide")
-    st.title("📊 申万一级行业趋势阶段分析")
-    st.caption("基于温斯坦（Weinstein）34周均线阶段分析法")
+# ── 趋势分析 Tab ──────────────────────────────────────────
 
-    # 数据更新时间
-    update_time = get_last_update_time()
-    st.sidebar.markdown(f"**数据更新时间:** {update_time}")
 
-    # 刷新按钮
-    if st.sidebar.button("🔄 刷新数据", use_container_width=True):
-        with st.spinner("正在下载最新数据..."):
-            from src.scraper import SWSScraper
-            with SWSScraper(headless=True) as scraper:
-                scraper.download_all()
-            st.cache_data.clear()
-            st.rerun()
-
-    # 加载数据
-    industry_data, summary = load_all_data()
-
-    if summary.empty:
-        st.warning("⚠️ 未找到本地数据。请先运行 `python main.py download` 下载数据，或点击侧边栏的「刷新数据」按钮。")
-        return
-
+def render_trend_tab(industry_data: dict, summary: pd.DataFrame):
+    """渲染趋势分析 Tab 的全部内容"""
     # 阶段分布概览
     st.subheader("阶段分布概览")
     render_stage_distribution(summary)
@@ -284,7 +268,7 @@ def main():
     st.subheader("行业阶段汇总")
     filter_options = ["全部阶段"] + [STAGE_LABELS[i] for i in range(1, 5)]
     stage_filter = st.selectbox("筛选阶段", filter_options)
-    filtered = render_summary_table(summary, stage_filter)
+    render_summary_table(summary, stage_filter)
 
     # K线图表
     st.subheader("行业周K线详情")
@@ -310,6 +294,347 @@ def main():
             recent_transitions["new_stage"] = recent_transitions["new_stage"].map(STAGE_LABELS)
             recent_transitions.columns = ["日期", "前阶段", "新阶段"]
             st.dataframe(recent_transitions, use_container_width=True, hide_index=True)
+
+
+# ── 回测 Tab ──────────────────────────────────────────────
+
+
+def _render_metrics_cards(result: BacktestResult):
+    """渲染绩效指标卡片"""
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    with c1:
+        st.metric("总收益率", f"{result.total_return * 100:+.1f}%")
+    with c2:
+        st.metric("年化收益率", f"{result.annualized_return * 100:+.1f}%")
+    with c3:
+        st.metric("最大回撤", f"{result.max_drawdown * 100:.1f}%")
+    with c4:
+        st.metric("夏普比率", f"{result.sharpe_ratio:.2f}")
+    with c5:
+        st.metric("胜率", f"{result.win_rate * 100:.1f}%")
+    with c6:
+        st.metric("总交易次数", f"{result.total_trades}")
+
+
+def _render_equity_curve(result: BacktestResult, benchmark: pd.DataFrame):
+    """渲染收益曲线图"""
+    ec = result.equity_curve
+
+    fig = go.Figure()
+
+    # 策略收益曲线
+    fig.add_trace(go.Scatter(
+        x=ec["date"],
+        y=ec["portfolio_value"],
+        mode="lines",
+        name="策略净值",
+        line=dict(color="#1E88E5", width=2),
+    ))
+
+    # 基准曲线
+    if not benchmark.empty:
+        fig.add_trace(go.Scatter(
+            x=benchmark["date"],
+            y=benchmark["benchmark_value"],
+            mode="lines",
+            name="等权基准",
+            line=dict(color="#9E9E9E", width=1.5, dash="dash"),
+        ))
+
+    fig.update_layout(
+        title="策略收益曲线 vs 等权基准",
+        xaxis_title="日期",
+        yaxis_title="组合价值",
+        height=400,
+        margin=dict(l=40, r=40, t=50, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        hovermode="x unified",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption("等权基准：回测起始日将等量资金平均分配到31个申万一级行业并持有不动，反映全行业被动持有的收益水平。")
+
+
+def _render_drawdown_chart(result: BacktestResult):
+    """渲染回撤曲线图"""
+    ec = result.equity_curve
+    running_max = ec["portfolio_value"].cummax()
+    drawdown = (ec["portfolio_value"] - running_max) / running_max * 100
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=ec["date"],
+        y=drawdown,
+        fill="tozeroy",
+        mode="lines",
+        name="回撤",
+        line=dict(color="#EF5350", width=1),
+        fillcolor="rgba(239, 83, 80, 0.3)",
+    ))
+    fig.update_layout(
+        title="回撤曲线",
+        xaxis_title="日期",
+        yaxis_title="回撤 (%)",
+        height=250,
+        margin=dict(l=40, r=40, t=50, b=40),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_positions_chart(result: BacktestResult):
+    """渲染持仓数量变化图"""
+    ec = result.equity_curve
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=ec["date"],
+        y=ec["n_positions"],
+        mode="lines",
+        name="持仓数量",
+        line=dict(color="#AB47BC", width=1.5),
+        fill="tozeroy",
+        fillcolor="rgba(171, 71, 188, 0.15)",
+    ))
+    fig.update_layout(
+        title="持仓数量变化",
+        xaxis_title="日期",
+        yaxis_title="持仓行业数",
+        height=200,
+        margin=dict(l=40, r=40, t=50, b=40),
+        yaxis=dict(dtick=1),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_current_positions(result: BacktestResult, industry_data: dict):
+    """渲染当前持仓表"""
+    st.markdown("**当前持仓**")
+    if not result.final_positions:
+        st.info("回测结束时无持仓")
+        return
+
+    rows = []
+    for pos in result.final_positions:
+        # 获取最新价格
+        if pos.code in industry_data:
+            _, weekly_df = industry_data[pos.code]
+            current_price = weekly_df["close"].iloc[-1]
+        else:
+            current_price = pos.entry_price
+
+        ret = pos.return_pct(current_price)
+        holding_weeks = 0
+        if not result.equity_curve.empty:
+            last_date = result.equity_curve["date"].iloc[-1]
+            holding_weeks = (last_date - pos.entry_date).days // 7
+
+        rows.append({
+            "行业": pos.name,
+            "代码": pos.code,
+            "买入日期": pos.entry_date.strftime("%Y-%m-%d"),
+            "买入价": f"{pos.entry_price:.2f}",
+            "现价": f"{current_price:.2f}",
+            "收益率": f"{ret * 100:+.1f}%",
+            "持仓周数": holding_weeks,
+        })
+
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
+def _render_trade_history(result: BacktestResult):
+    """渲染交易历史表"""
+    st.markdown("**交易历史**")
+    if not result.trades:
+        st.info("无交易记录")
+        return
+
+    reason_labels = {
+        "breakout_confirmed": "确认突破",
+        "breakdown_confirmed": "确认崩盘",
+        "replaced_weakest": "弱势替换",
+    }
+    action_labels = {"buy": "买入", "sell": "卖出"}
+
+    # 建立买入记录映射，用于计算卖出时的持仓时间
+    buy_history: dict[str, list] = {}  # {code: [Trade, ...]}
+    for t in result.trades:
+        if t.action == "buy":
+            buy_history.setdefault(t.code, []).append(t)
+
+    rows = []
+    for t in reversed(result.trades):
+        holding_info = ""
+        pnl_info = ""
+        if t.action == "sell":
+            buys = [b for b in buy_history.get(t.code, []) if b.date <= t.date]
+            if buys:
+                entry = buys[-1]
+                weeks = (t.date - entry.date).days // 7
+                holding_info = f"{weeks} 周"
+                ret = (t.price - entry.price) / entry.price
+                pnl_info = f"{ret * 100:+.1f}%"
+
+        rows.append({
+            "日期": t.date.strftime("%Y-%m-%d"),
+            "行业": t.name,
+            "操作": action_labels.get(t.action, t.action),
+            "价格": f"{t.price:.2f}",
+            "金额": f"{t.value:,.0f}",
+            "盈亏": pnl_info,
+            "持仓时间": holding_info,
+            "原因": reason_labels.get(t.reason, t.reason),
+        })
+
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=400)
+
+
+def render_backtest_tab(industry_data: dict):
+    """渲染策略回测 Tab"""
+    st.subheader("Weinstein 行业轮动策略回测")
+
+    # 获取数据日期范围
+    all_dates = set()
+    for code, (name, weekly_df) in industry_data.items():
+        valid = weekly_df.dropna(subset=["ma34"])
+        if not valid.empty:
+            all_dates.update(valid["date"].tolist())
+
+    if not all_dates:
+        st.warning("数据不足，无法运行回测")
+        return
+
+    sorted_dates = sorted(all_dates)
+    min_date = sorted_dates[0].to_pydatetime().date()
+    max_date = sorted_dates[-1].to_pydatetime().date()
+
+    # 参数设置
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        date_range = st.date_input(
+            "回测区间",
+            value=(datetime(2005, 1, 1).date(), max_date),
+            min_value=min_date,
+            max_value=max_date,
+        )
+    with col2:
+        initial_capital = st.number_input(
+            "初始资金", value=10000, min_value=1000, step=1000
+        )
+    with col3:
+        max_positions = st.number_input(
+            "最大持仓数", value=5, min_value=1, max_value=10, step=1
+        )
+
+    # 处理日期输入（可能是元组或单个日期）
+    if isinstance(date_range, tuple) and len(date_range) == 2:
+        start_dt, end_dt = date_range
+    else:
+        st.warning("请选择完整的起止日期")
+        return
+
+    run_clicked = st.button("运行回测", type="primary", use_container_width=True)
+
+    if run_clicked:
+        with st.spinner("正在运行回测...（首次运行需计算所有行业信号，约需10-30秒）"):
+            bt_config = BacktestConfig(
+                initial_capital=float(initial_capital),
+                max_positions=int(max_positions),
+                start_date=str(start_dt),
+                end_date=str(end_dt),
+            )
+            result = run_backtest(industry_data, bt_config)
+            benchmark = compute_benchmark(
+                industry_data,
+                initial_capital=float(initial_capital),
+                start_date=pd.Timestamp(start_dt),
+                end_date=pd.Timestamp(end_dt),
+            )
+            st.session_state["backtest_result"] = result
+            st.session_state["backtest_benchmark"] = benchmark
+
+    # 展示结果
+    if "backtest_result" not in st.session_state:
+        st.info("设置参数后点击「运行回测」查看结果")
+        return
+
+    result: BacktestResult = st.session_state["backtest_result"]
+    benchmark: pd.DataFrame = st.session_state.get("backtest_benchmark", pd.DataFrame())
+
+    if result.equity_curve.empty:
+        st.warning("回测期间无交易信号，请调整回测区间")
+        return
+
+    # 绩效指标卡片
+    _render_metrics_cards(result)
+
+    # 附加指标
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1:
+        st.metric("平均持仓周数", f"{result.avg_holding_weeks:.1f}")
+    with c2:
+        st.metric("最大回撤持续", f"{result.max_drawdown_duration_weeks} 周")
+    with c3:
+        final_value = result.equity_curve["portfolio_value"].iloc[-1]
+        st.metric("期末资产", f"{final_value:,.0f}")
+    with c4:
+        st.metric("盈亏比", f"{result.profit_loss_ratio:.2f}")
+    with c5:
+        best_label = f"{result.best_trade_name} ({result.best_trade_return * 100:+.1f}%)" if result.best_trade_name else "—"
+        st.metric("最佳单笔交易", best_label)
+
+    # 收益曲线
+    _render_equity_curve(result, benchmark)
+
+    # 回撤曲线 + 持仓数量
+    col_dd, col_pos = st.columns(2)
+    with col_dd:
+        _render_drawdown_chart(result)
+    with col_pos:
+        _render_positions_chart(result)
+
+    # 当前持仓 + 交易历史
+    col_left, col_right = st.columns([1, 2])
+    with col_left:
+        _render_current_positions(result, industry_data)
+    with col_right:
+        _render_trade_history(result)
+
+
+# ── 主入口 ──────────────────────────────────────────────
+
+
+def main():
+    st.set_page_config(page_title="行业趋势跟踪", page_icon="📊", layout="wide")
+    st.title("📊 申万一级行业趋势阶段分析")
+    st.caption("基于温斯坦（Weinstein）34周均线阶段分析法")
+
+    # 数据更新时间
+    update_time = get_last_update_time()
+    st.sidebar.markdown(f"**数据更新时间:** {update_time}")
+
+    # 刷新按钮
+    if st.sidebar.button("🔄 刷新数据", use_container_width=True):
+        with st.spinner("正在下载最新数据..."):
+            from src.scraper import SWSScraper
+            with SWSScraper(headless=True) as scraper:
+                scraper.download_all()
+            st.cache_data.clear()
+            st.rerun()
+
+    # 加载数据
+    industry_data, summary = load_all_data()
+
+    if summary.empty:
+        st.warning("⚠️ 未找到本地数据。请先运行 `python main.py download` 下载数据，或点击侧边栏的「刷新数据」按钮。")
+        return
+
+    # Tab 页切换
+    tab_trend, tab_backtest = st.tabs(["趋势分析", "策略回测"])
+
+    with tab_trend:
+        render_trend_tab(industry_data, summary)
+
+    with tab_backtest:
+        render_backtest_tab(industry_data)
 
 
 if __name__ == "__main__":
