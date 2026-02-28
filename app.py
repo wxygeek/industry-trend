@@ -14,8 +14,17 @@ from plotly.subplots import make_subplots
 import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from config.industries import SW_LEVEL1_INDUSTRIES
-from src.scraper import load_existing_csv, DATA_DIR
+from config.industries import (
+    SW_LEVEL1_INDUSTRIES, SW_LEVEL2_INDUSTRIES,
+    get_industries, get_level2_by_parent,
+)
+from src.scraper import load_existing_csv as load_level1_csv
+from src.scraper import DATA_DIR as LEVEL1_DATA_DIR
+from src.akshare_downloader import (
+    load_existing_csv as load_level2_csv,
+    LEVEL2_DATA_DIR,
+    analysis_dir_for_level,
+)
 from src.kline import generate_weekly_kline
 from src.stage_analyzer import (
     batch_analyze, analyze_industry, detect_stage_transitions,
@@ -42,11 +51,14 @@ STAGE_LABELS = {
 
 
 @st.cache_data(ttl=300)
-def load_all_data():
-    """加载所有行业数据并计算周K线和阶段"""
+def load_all_data(level: int):
+    """加载指定级别的所有行业数据并计算周K线和阶段"""
+    industries = get_industries(level)
+    load_csv = load_level1_csv if level == 1 else (lambda c, n: load_level2_csv(c, n, 2))
+
     industry_data = {}
-    for code, name in SW_LEVEL1_INDUSTRIES.items():
-        daily_df = load_existing_csv(code, name)
+    for code, name in industries.items():
+        daily_df = load_csv(code, name)
         if daily_df is None or daily_df.empty:
             continue
         weekly_df = generate_weekly_kline(daily_df)
@@ -57,12 +69,20 @@ def load_all_data():
 
     config = StageConfig()
     summary = batch_analyze(industry_data, config)
+
+    # 保存分析结果
+    if not summary.empty:
+        out_dir = analysis_dir_for_level(level)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        summary.to_csv(out_dir / "stage_summary.csv", index=False)
+
     return industry_data, summary
 
 
-def get_last_update_time() -> str:
+def get_last_update_time(level: int) -> str:
     """获取数据最后更新时间"""
-    csv_files = list(DATA_DIR.glob("*.csv"))
+    data_dir = LEVEL1_DATA_DIR if level == 1 else LEVEL2_DATA_DIR
+    csv_files = list(data_dir.glob("*.csv"))
     if not csv_files:
         return "无数据"
     latest = max(csv_files, key=lambda f: f.stat().st_mtime)
@@ -95,7 +115,7 @@ def render_stage_distribution(summary: pd.DataFrame):
     st.plotly_chart(fig, use_container_width=True)
 
 
-def render_summary_table(summary: pd.DataFrame, stage_filter: str):
+def render_summary_table(summary: pd.DataFrame, stage_filter: str, level: int = 1):
     """渲染行业汇总表格"""
     df = summary.copy()
 
@@ -103,9 +123,20 @@ def render_summary_table(summary: pd.DataFrame, stage_filter: str):
         stage_num = int(stage_filter.split(" ")[1])
         df = df[df["stage"] == stage_num]
 
-    display_df = df[["name", "code", "stage_label", "confidence", "close", "ma34",
-                     "price_position", "ma_slope"]].copy()
-    display_df.columns = ["行业名称", "行业代码", "当前阶段", "置信度", "收盘价", "MA34", "偏离度", "MA斜率"]
+    cols = ["name", "code", "stage_label", "confidence", "close", "ma34",
+            "price_position", "ma_slope"]
+    display_cols = ["行业名称", "行业代码", "当前阶段", "置信度", "收盘价", "MA34", "偏离度", "MA斜率"]
+
+    # 二级行业增加所属一级行业列
+    if level == 2:
+        df["parent_name"] = df["code"].apply(
+            lambda c: SW_LEVEL1_INDUSTRIES.get(SW_LEVEL2_INDUSTRIES.get(c, ("", ""))[1], "")
+        )
+        cols = ["parent_name"] + cols
+        display_cols = ["所属一级"] + display_cols
+
+    display_df = df[cols].copy()
+    display_df.columns = display_cols
     display_df["偏离度"] = display_df["偏离度"].apply(lambda x: f"{x*100:+.2f}%")
     display_df["MA斜率方向"] = display_df["MA斜率"].apply(
         lambda x: "↑ 上升" if x > 0.005 else ("↓ 下降" if x < -0.005 else "→ 走平")
@@ -258,30 +289,77 @@ def render_kline_chart(weekly_df: pd.DataFrame, code: str, name: str, weeks: int
 # ── 趋势分析 Tab ──────────────────────────────────────────
 
 
-def render_trend_tab(industry_data: dict, summary: pd.DataFrame):
+def render_trend_tab(industry_data: dict, summary: pd.DataFrame, level: int = 1):
     """渲染趋势分析 Tab 的全部内容"""
+    level_name = "一" if level == 1 else "二"
+
     # 阶段分布概览
     st.subheader("阶段分布概览")
     render_stage_distribution(summary)
 
     # 阶段筛选
     st.subheader("行业阶段汇总")
-    filter_options = ["全部阶段"] + [STAGE_LABELS[i] for i in range(1, 5)]
-    stage_filter = st.selectbox("筛选阶段", filter_options)
-    render_summary_table(summary, stage_filter)
+
+    filter_cols = st.columns([1, 1] if level == 2 else [1])
+
+    with filter_cols[0]:
+        filter_options = ["全部阶段"] + [STAGE_LABELS[i] for i in range(1, 5)]
+        stage_filter = st.selectbox("筛选阶段", filter_options, key=f"stage_filter_l{level}")
+
+    # 二级行业增加一级行业筛选
+    parent_filter = None
+    if level == 2 and len(filter_cols) > 1:
+        with filter_cols[1]:
+            parent_options = ["全部一级行业"] + [
+                f"{name}({code})" for code, name in SW_LEVEL1_INDUSTRIES.items()
+            ]
+            parent_filter = st.selectbox("筛选所属一级行业", parent_options, key="parent_filter_l2")
+
+    # 对二级行业应用一级行业筛选
+    filtered_summary = summary
+    if level == 2 and parent_filter and parent_filter != "全部一级行业":
+        parent_code = parent_filter.split("(")[1].rstrip(")")
+        child_codes = set(get_level2_by_parent(parent_code).keys())
+        filtered_summary = summary[summary["code"].isin(child_codes)]
+
+    render_summary_table(filtered_summary, stage_filter, level)
 
     # K线图表
     st.subheader("行业周K线详情")
-    available = {f"{name}({code})": code for code, (name, _) in industry_data.items()}
-    selected_label = st.selectbox("选择行业", list(available.keys()))
 
-    if selected_label:
+    # 二级行业按一级行业分组选择
+    if level == 2:
+        group_col, select_col = st.columns([1, 2])
+        with group_col:
+            group_options = ["全部二级行业"] + [
+                f"{name}({code})" for code, name in SW_LEVEL1_INDUSTRIES.items()
+                if any(SW_LEVEL2_INDUSTRIES.get(c, ("", ""))[1] == code for c in industry_data)
+            ]
+            group_choice = st.selectbox("按一级行业分组", group_options, key="kline_group_l2")
+
+        if group_choice == "全部二级行业":
+            available = {f"{name}({code})": code for code, (name, _) in industry_data.items()}
+        else:
+            grp_code = group_choice.split("(")[1].rstrip(")")
+            available = {
+                f"{name}({code})": code
+                for code, (name, _) in industry_data.items()
+                if SW_LEVEL2_INDUSTRIES.get(code, ("", ""))[1] == grp_code
+            }
+        with select_col:
+            selected_label = st.selectbox("选择行业", sorted(available.keys()), key=f"kline_select_l{level}")
+    else:
+        available = {f"{name}({code})": code for code, (name, _) in industry_data.items()}
+        selected_label = st.selectbox("选择行业", list(available.keys()), key=f"kline_select_l{level}")
+
+    if selected_label and selected_label in available:
         selected_code = available[selected_label]
         name, weekly_df = industry_data[selected_code]
 
         col1, col2 = st.columns([3, 1])
         with col2:
-            weeks_display = st.slider("显示周数", min_value=26, max_value=260, value=104, step=26)
+            weeks_display = st.slider("显示周数", min_value=26, max_value=260, value=104, step=26,
+                                      key=f"weeks_slider_l{level}")
 
         render_kline_chart(weekly_df, selected_code, name, weeks=weeks_display)
 
@@ -316,9 +394,11 @@ def _render_metrics_cards(result: BacktestResult):
         st.metric("总交易次数", f"{result.total_trades}")
 
 
-def _render_equity_curve(result: BacktestResult, benchmark: pd.DataFrame):
+def _render_equity_curve(result: BacktestResult, benchmark: pd.DataFrame, level: int = 1):
     """渲染收益曲线图"""
     ec = result.equity_curve
+    level_name = "一" if level == 1 else "二"
+    n_industries = len(get_industries(level))
 
     fig = go.Figure()
 
@@ -351,7 +431,10 @@ def _render_equity_curve(result: BacktestResult, benchmark: pd.DataFrame):
         hovermode="x unified",
     )
     st.plotly_chart(fig, use_container_width=True)
-    st.caption("等权基准：回测起始日将等量资金平均分配到31个申万一级行业并持有不动，反映全行业被动持有的收益水平。")
+    st.caption(
+        f"等权基准：回测起始日将等量资金平均分配到{n_industries}个申万{level_name}级行业并持有不动，"
+        f"反映全行业被动持有的收益水平。"
+    )
 
 
 def _render_drawdown_chart(result: BacktestResult):
@@ -487,9 +570,10 @@ def _render_trade_history(result: BacktestResult):
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=400)
 
 
-def render_backtest_tab(industry_data: dict):
+def render_backtest_tab(industry_data: dict, level: int = 1):
     """渲染策略回测 Tab"""
-    st.subheader("Weinstein 行业轮动策略回测")
+    level_name = "一" if level == 1 else "二"
+    st.subheader(f"Weinstein {level_name}级行业轮动策略回测")
 
     # 获取数据日期范围
     all_dates = set()
@@ -514,14 +598,19 @@ def render_backtest_tab(industry_data: dict):
             value=(datetime(2005, 1, 1).date(), max_date),
             min_value=min_date,
             max_value=max_date,
+            key=f"bt_date_l{level}",
         )
     with col2:
         initial_capital = st.number_input(
-            "初始资金", value=10000, min_value=1000, step=1000
+            "初始资金", value=10000, min_value=1000, step=1000,
+            key=f"bt_capital_l{level}",
         )
     with col3:
+        default_max_pos = 5 if level == 1 else 10
+        max_pos_limit = 15 if level == 2 else 10
         max_positions = st.number_input(
-            "最大持仓数", value=5, min_value=1, max_value=10, step=1
+            "最大持仓数", value=default_max_pos, min_value=1, max_value=max_pos_limit, step=1,
+            key=f"bt_maxpos_l{level}",
         )
 
     # 处理日期输入（可能是元组或单个日期）
@@ -531,10 +620,15 @@ def render_backtest_tab(industry_data: dict):
         st.warning("请选择完整的起止日期")
         return
 
-    run_clicked = st.button("运行回测", type="primary", use_container_width=True)
+    session_key_result = f"backtest_result_l{level}"
+    session_key_benchmark = f"backtest_benchmark_l{level}"
+
+    run_clicked = st.button("运行回测", type="primary", use_container_width=True,
+                            key=f"bt_run_l{level}")
 
     if run_clicked:
-        with st.spinner("正在运行回测...（首次运行需计算所有行业信号，约需10-30秒）"):
+        n = len(industry_data)
+        with st.spinner(f"正在运行{level_name}级行业回测（{n}个行业）..."):
             bt_config = BacktestConfig(
                 initial_capital=float(initial_capital),
                 max_positions=int(max_positions),
@@ -548,16 +642,16 @@ def render_backtest_tab(industry_data: dict):
                 start_date=pd.Timestamp(start_dt),
                 end_date=pd.Timestamp(end_dt),
             )
-            st.session_state["backtest_result"] = result
-            st.session_state["backtest_benchmark"] = benchmark
+            st.session_state[session_key_result] = result
+            st.session_state[session_key_benchmark] = benchmark
 
     # 展示结果
-    if "backtest_result" not in st.session_state:
+    if session_key_result not in st.session_state:
         st.info("设置参数后点击「运行回测」查看结果")
         return
 
-    result: BacktestResult = st.session_state["backtest_result"]
-    benchmark: pd.DataFrame = st.session_state.get("backtest_benchmark", pd.DataFrame())
+    result: BacktestResult = st.session_state[session_key_result]
+    benchmark: pd.DataFrame = st.session_state.get(session_key_benchmark, pd.DataFrame())
 
     if result.equity_curve.empty:
         st.warning("回测期间无交易信号，请调整回测区间")
@@ -582,7 +676,7 @@ def render_backtest_tab(industry_data: dict):
         st.metric("最佳单笔交易", best_label)
 
     # 收益曲线
-    _render_equity_curve(result, benchmark)
+    _render_equity_curve(result, benchmark, level)
 
     # 回撤曲线 + 持仓数量
     col_dd, col_pos = st.columns(2)
@@ -604,37 +698,67 @@ def render_backtest_tab(industry_data: dict):
 
 def main():
     st.set_page_config(page_title="行业趋势跟踪", page_icon="📊", layout="wide")
-    st.title("📊 申万一级行业趋势阶段分析")
-    st.caption("基于温斯坦（Weinstein）34周均线阶段分析法")
+    st.title("📊 申万行业趋势阶段分析")
+    st.caption("基于温斯坦（Weinstein）34周均线阶段分析法 · 支持一级/二级行业")
 
-    # 数据更新时间
-    update_time = get_last_update_time()
-    st.sidebar.markdown(f"**数据更新时间:** {update_time}")
+    # 侧边栏
+    st.sidebar.markdown(f"**一级行业数据:** {get_last_update_time(1)}")
+    st.sidebar.markdown(f"**二级行业数据:** {get_last_update_time(2)}")
 
-    # 刷新按钮
-    if st.sidebar.button("🔄 刷新数据", use_container_width=True):
-        with st.spinner("正在下载最新数据..."):
+    if st.sidebar.button("🔄 刷新一级数据", use_container_width=True):
+        with st.spinner("正在下载一级行业最新数据..."):
             from src.scraper import SWSScraper
             with SWSScraper(headless=True) as scraper:
                 scraper.download_all()
             st.cache_data.clear()
             st.rerun()
 
-    # 加载数据
-    industry_data, summary = load_all_data()
+    if st.sidebar.button("🔄 刷新二级数据", use_container_width=True):
+        with st.spinner("正在下载二级行业最新数据..."):
+            from src.akshare_downloader import download_all as ak_download
+            ak_download(level=2)
+            st.cache_data.clear()
+            st.rerun()
 
-    if summary.empty:
-        st.warning("⚠️ 未找到本地数据。请先运行 `python main.py download` 下载数据，或点击侧边栏的「刷新数据」按钮。")
+    # 加载数据
+    l1_data, l1_summary = load_all_data(1)
+    l2_data, l2_summary = load_all_data(2)
+
+    has_l1 = l1_summary is not None and not l1_summary.empty
+    has_l2 = l2_summary is not None and not l2_summary.empty
+
+    if not has_l1 and not has_l2:
+        st.warning(
+            "⚠️ 未找到本地数据。请先运行以下命令下载数据：\n"
+            "- 一级行业: `python main.py download`\n"
+            "- 二级行业: `python main.py download --level 2`"
+        )
         return
 
-    # Tab 页切换
-    tab_trend, tab_backtest = st.tabs(["趋势分析", "策略回测"])
+    # 4 Tab 页切换
+    tab_names = []
+    if has_l1:
+        tab_names += ["一级趋势分析", "一级策略回测"]
+    if has_l2:
+        tab_names += ["二级趋势分析", "二级策略回测"]
 
-    with tab_trend:
-        render_trend_tab(industry_data, summary)
+    tabs = st.tabs(tab_names)
 
-    with tab_backtest:
-        render_backtest_tab(industry_data)
+    tab_idx = 0
+    if has_l1:
+        with tabs[tab_idx]:
+            render_trend_tab(l1_data, l1_summary, level=1)
+        tab_idx += 1
+        with tabs[tab_idx]:
+            render_backtest_tab(l1_data, level=1)
+        tab_idx += 1
+
+    if has_l2:
+        with tabs[tab_idx]:
+            render_trend_tab(l2_data, l2_summary, level=2)
+        tab_idx += 1
+        with tabs[tab_idx]:
+            render_backtest_tab(l2_data, level=2)
 
 
 if __name__ == "__main__":

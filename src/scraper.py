@@ -17,7 +17,7 @@ from config.industries import SW_LEVEL1_INDUSTRIES, SWS_DETAIL_URL
 
 logger = logging.getLogger(__name__)
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "daily"
+DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "sw_level1" / "daily"
 
 COLUMN_MAP = {
     "指数代码": "code",
